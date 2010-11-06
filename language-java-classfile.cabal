@@ -19,7 +19,7 @@ License:             BSD3
 License-file:        LICENSE
 
 Author:              Dr. ERDI Gergo <http://gergo.erdi.hu/>
-Maintainer:          gergo@erdi.hu
+Maintainer:          Dr. ERDI Gergo <gergo@erdi.hu>
 
 -- A copyright notice.
 -- Copyright:           
@@ -41,7 +41,7 @@ Library
   Build-depends:       base >= 2 && < 5,
                        parsec >= 2 && < 4,
                        language-java,
-                       mtl >= 1 && < 2,
+                       mtl,
                        data-flags,
                        array,
                        utf8-string, bytestring,
