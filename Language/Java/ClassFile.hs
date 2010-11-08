@@ -1,5 +1,11 @@
 {-# LANGUAGE DoRec #-}
-module Language.Java.ClassFile (getClass, nameConstructor) where
+module Language.Java.ClassFile (
+  ImportedDecl(..),
+  -- * Classfile parsing
+  getClass, 
+  -- * Magic identifiers
+  nameConstructor
+  ) where
 
 import Language.Java.Syntax
 import Data.Binary.Get
@@ -14,6 +20,8 @@ import Data.Flags
 import Control.Monad.Reader
 import Text.ParserCombinators.Parsec
 import Data.List
+
+import Debug.Trace
 
 parseFull :: Parser a -> Parser a
 -- language-java depends on Parsec 2, which is not Applicative...
@@ -48,7 +56,7 @@ readType s = case parse (parseFull parseType) "" s of
 
 parseClassType :: Parser ClassType
 parseClassType = 
-  do parts <- (many1 alphaNum) `sepBy` (char '/')
+  do parts <- (many1 alphaNum) `sepBy` (char '/' <|> char '$')
      let ids = map (\ part -> (Ident part, [])) parts
      return $ ClassType ids
 
@@ -132,32 +140,15 @@ getConstants = do
 classObject :: ClassType
 classObject = ClassType [(Ident "java", []), (Ident "lang", []), (Ident "Object", [])]
 
+-- |Constructors are encoded in .class files as member functions of the name \"@\<init>@\".
 nameConstructor :: String
 nameConstructor = "<init>"
 
 getClassType :: ClassImporter ClassType
 getClassType = constClass <$> getConstantRef
 
-getClass :: Get TypeDecl
-getClass = 
-  do (_major, _minor) <- getHeader
-     constTable <- getConstants
-     flip runReaderT constTable $
-       do (isInterface, modifiers) <- getToplevel
-     
-          ClassType [(this, _)] <- getClassType
-          superClass <- getClassType
-          let super = if superClass == classObject then Nothing else Just (ClassRefType superClass)
-     
-          ifaces <- getMany (ClassRefType <$> getClassType)
-          fields <- getMany getField
-          methods <- catMaybes <$> getMany (getMethod this)
-          
-          _attributes <- getAttributes
-     
-          return $ if isInterface
-                     then InterfaceTypeDecl $ InterfaceDecl modifiers this [] ifaces (InterfaceBody [])
-                     else ClassTypeDecl $ ClassDecl modifiers this [] super ifaces (ClassBody $ map MemberDecl $ fields ++ methods)
+-- getClassTypeMaybe :: ClassImporter (Maybe ClassType)
+-- getClassTypeMaybe = constClassMaybe <$> 
 
 getHeader = 
   do signature <- replicateM 4 getWord8
@@ -167,20 +158,34 @@ getHeader =
      major <- getWord16be
      return (major, minor)
     
-getConstantRef :: ClassImporter Constant
-getConstantRef = 
+getConstantRefMaybe :: ClassImporter (Maybe Constant)
+getConstantRefMaybe =
   do idx <- lift getConstIdx
-     asks (!idx)
+     if idx == 0 then return Nothing else Just <$> asks (!idx)
+
+getConstantRef :: ClassImporter Constant
+getConstantRef = fromJust <$> getConstantRefMaybe
                        
-getStringRef :: ClassImporter String                       
-getStringRef = 
-  do const <- getConstantRef
-     case const of
-       ConstantString s -> return s
+getStringRefMaybe ::ClassImporter (Maybe String)                 
+getStringRefMaybe = 
+  do const <- getConstantRefMaybe
+     return $ case const of
+       Just (ConstantString s) -> Just s
+       _ -> Nothing
+                 
+getStringRef :: ClassImporter String
+getStringRef = fromJust <$> getStringRefMaybe
+     
+data InnerClass = InnerClass { innerInner :: ClassType, 
+                               innerOuter :: Maybe ClassType,
+                               innerName :: Maybe String,
+                               innerFlags :: Word16 }
+                  deriving Show
      
 data Attribute = AttrConstantValue ConstantValue
                | AttrExceptions [ClassType]
                | AttrSynthetic
+               | AttrInnerClasses [InnerClass]
                deriving Show
                         
 isAttrSynthetic AttrSynthetic = True
@@ -190,8 +195,19 @@ isAttrConstantValue (AttrConstantValue _) = True
 isAttrConstantValue _ = False
                     
 isAttrExceptions (AttrExceptions _) = True
-isAttrExceptions _ = False
-                        
+isAttrExceptions _ = False                     
+                     
+isAttrInnerClasses (AttrInnerClasses _) = True
+isAttrInnerClasses _ = False
+
+getInnerClass :: ClassImporter InnerClass
+getInnerClass =
+  do inner <- getClassType
+     outer <- fmap constClass <$> getConstantRefMaybe
+     name <- getStringRefMaybe
+     flags <- lift getWord16be
+     return $ InnerClass inner outer name flags
+
 getAttribute :: ClassImporter (Maybe Attribute)
 getAttribute = 
   do name <- getStringRef
@@ -206,13 +222,15 @@ getAttribute =
                 ConstantValue val -> val
        "Exceptions" ->
          Just <$> AttrExceptions <$> getMany getClassType
+       "InnerClasses" ->
+         do Just <$> AttrInnerClasses <$> getMany getInnerClass            
        _ -> 
          do lift $ skip (fromIntegral len)
             return Nothing
      
 getAttributes = catMaybes <$> getMany getAttribute     
      
-getField :: ClassImporter MemberDecl
+getField :: ClassImporter (Maybe MemberDecl)
 getField = 
   do modifiers <- getModifiers
      name <- getStringRef
@@ -227,7 +245,8 @@ getField =
                ValueString s -> String s
                ValueFloat x -> Float $ realToFrac x
                ValueDouble x -> Double x
-     return $ FieldDecl modifiers ty [VarDecl (VarId $ Ident name) init]   
+     return $ unlessSynthetic attributes $ 
+       FieldDecl modifiers ty [VarDecl (VarId $ Ident name) init]   
 
 getMethod :: Ident -> ClassImporter (Maybe MemberDecl)
 getMethod cls =
@@ -240,12 +259,13 @@ getMethod cls =
      let exceptions = case find (isAttrExceptions) attributes of
            Nothing -> []
            Just (AttrExceptions tys) -> map ClassRefType tys
-     return $
-       if any isAttrSynthetic attributes then Nothing
-         else Just $ 
-           if isConstructor 
-             then ConstructorDecl modifiers [] cls formals exceptions (ConstructorBody Nothing [])
-             else MethodDecl modifiers [] ret (Ident name) formals exceptions (MethodBody Nothing)
+     return $ unlessSynthetic attributes $
+       if isConstructor 
+         then ConstructorDecl modifiers [] cls formals exceptions (ConstructorBody Nothing [])
+         else MethodDecl modifiers [] ret (Ident name) formals exceptions (MethodBody Nothing)
+
+unlessSynthetic :: [Attribute] -> a -> Maybe a
+unlessSynthetic attributes x = if any isAttrSynthetic attributes then Nothing else Just x
 
 parseModifiers :: Word16 -> [Modifier]
 parseModifiers flags =
@@ -272,3 +292,52 @@ getToplevel =
      let iface = 0x0200 .~. flags
          modifiers = parseModifiers flags
      return (iface, modifiers)
+
+data ImportedDecl = ImportedTopLevel TypeDecl
+                  | ImportedInner TypeDecl
+
+type DeclMap = [(ClassType, ImportedDecl)]
+
+-- |Parse a binary .class file into a 'TypeDecl'
+getClass :: Maybe DeclMap -> Get (ClassType, ImportedDecl)
+getClass declMap = 
+  do (_major, _minor) <- getHeader
+     constTable <- getConstants
+     flip runReaderT constTable $
+       do (isInterface, modifiers) <- getToplevel
+     
+          classType@(ClassType parts) <- getClassType
+          let (this, _) = last parts
+          superClass <- getClassType
+          let super = if superClass == classObject then Nothing else Just (ClassRefType superClass)
+     
+          ifaces <- getMany (ClassRefType <$> getClassType)
+          fields <- catMaybes <$> getMany getField
+          methods <- catMaybes <$> getMany (getMethod this)
+          
+          attributes <- getAttributes
+          let innerClasses = 
+                case find isAttrInnerClasses attributes of
+                  Nothing -> []
+                  Just (AttrInnerClasses ics) -> ics                  
+              innerDecls = mapMaybe (toInnerDecl classType) innerClasses
+              isInner = any (\ ic -> innerInner ic == classType) innerClasses
+              
+          let members = fields ++ methods ++ innerDecls
+              decl = if isInterface
+                       then InterfaceTypeDecl $ InterfaceDecl modifiers this [] ifaces (InterfaceBody members)
+                       else ClassTypeDecl $ ClassDecl modifiers this [] super ifaces (ClassBody $ map MemberDecl members)
+     
+          return (classType, (if isInner then ImportedInner else ImportedTopLevel) decl)
+          
+  where toInnerDecl classType ic = 
+          do outer <- innerOuter ic             
+             guard $ outer == classType
+             ImportedInner inner <- lookup (innerInner ic) =<< declMap
+             let modifiers = parseModifiers $ innerFlags ic
+             return $ case inner of
+               ClassTypeDecl classDecl -> MemberClassDecl $ classDecl `withClassModifiers` modifiers
+               InterfaceTypeDecl ifaceDecl -> MemberInterfaceDecl $ ifaceDecl `withInterfaceModifiers` modifiers
+        
+        (ClassDecl _ id tys super ifaces body) `withClassModifiers` ms = ClassDecl ms id tys super ifaces body
+        (InterfaceDecl _ id tys ifaces body) `withInterfaceModifiers` ms = InterfaceDecl ms id tys ifaces body

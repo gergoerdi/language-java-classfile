@@ -7,12 +7,21 @@ import Language.Java.ClassFile
 import Data.Binary.Get  
 import qualified Data.ByteString.Lazy as BL
 import Control.Applicative
+import Control.Monad (replicateM)
+import Data.Maybe (mapMaybe)
 
 test = 
   do   
-    file <- BL.readFile f
-    return $ runGet getClass file
+    streams <- mapM BL.readFile files
+    
+    let decls = map (runGet (getClass $ Just decls)) streams
+    return decls
   where
-    f = "test/Foo.class"
-  
-main = print =<< pretty <$> test
+    files = ["test/Foo.class", "test/Foo$Bar.class"]
+    
+main = 
+  do decls <- test     
+     let decls' = mapMaybe (filterTopLevel . snd) decls
+     mapM_ print $ map pretty decls'
+  where filterTopLevel (ImportedTopLevel decl) = Just decl
+        filterTopLevel _ = Nothing
