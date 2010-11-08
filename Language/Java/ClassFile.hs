@@ -2,7 +2,9 @@
 module Language.Java.ClassFile (
   ImportedDecl(..),
   -- * Classfile parsing
-  getClass, 
+  getSingleClass, 
+  getClass,
+  parseClasses,
   -- * Magic identifiers
   nameConstructor
   ) where
@@ -12,6 +14,7 @@ import Data.Binary.Get
 import Data.Binary.IEEE754
 import Data.ByteString.UTF8 (toString)
 import Data.Maybe
+import Data.ByteString.Lazy (ByteString)
 import Control.Monad
 import Data.Word
 import Control.Applicative ((<$>), (<$), (<*>)) -- (<*) (see parseFull)
@@ -294,9 +297,20 @@ getToplevel =
      return (iface, modifiers)
 
 data ImportedDecl = ImportedTopLevel TypeDecl
-                  | ImportedInner TypeDecl
+                  | ImportedInner ClassType TypeDecl
 
 type DeclMap = [(ClassType, ImportedDecl)]
+
+getSingleClass :: Get ImportedDecl
+getSingleClass = snd <$> getClass Nothing
+
+parseClasses :: [ByteString] -> [(ClassType, TypeDecl)]
+parseClasses streams = 
+  let declMap = map (runGet (getClass $ Just declMap)) streams 
+  in mapMaybe toDecl declMap
+  where toDecl (classType, (ImportedTopLevel decl)) = Just (classType, decl)
+        toDecl _ = Nothing
+
 
 -- |Parse a binary .class file into a 'TypeDecl'
 getClass :: Maybe DeclMap -> Get (ClassType, ImportedDecl)
@@ -321,19 +335,21 @@ getClass declMap =
                   Nothing -> []
                   Just (AttrInnerClasses ics) -> ics                  
               innerDecls = mapMaybe (toInnerDecl classType) innerClasses
-              isInner = any (\ ic -> innerInner ic == classType) innerClasses
+              outer = getOuter classType innerClasses
               
           let members = fields ++ methods ++ innerDecls
               decl = if isInterface
                        then InterfaceTypeDecl $ InterfaceDecl modifiers this [] ifaces (InterfaceBody members)
                        else ClassTypeDecl $ ClassDecl modifiers this [] super ifaces (ClassBody $ map MemberDecl members)
      
-          return (classType, (if isInner then ImportedInner else ImportedTopLevel) decl)
+          return (classType, case outer of
+                     Nothing -> ImportedTopLevel decl
+                     Just outer -> ImportedInner outer decl)
           
   where toInnerDecl classType ic = 
           do outer <- innerOuter ic             
              guard $ outer == classType
-             ImportedInner inner <- lookup (innerInner ic) =<< declMap
+             ImportedInner _ inner <- lookup (innerInner ic) =<< declMap
              let modifiers = parseModifiers $ innerFlags ic
              return $ case inner of
                ClassTypeDecl classDecl -> MemberClassDecl $ classDecl `withClassModifiers` modifiers
@@ -341,3 +357,5 @@ getClass declMap =
         
         (ClassDecl _ id tys super ifaces body) `withClassModifiers` ms = ClassDecl ms id tys super ifaces body
         (InterfaceDecl _ id tys ifaces body) `withInterfaceModifiers` ms = InterfaceDecl ms id tys ifaces body
+
+        getOuter classType ics = innerInner <$> find (\ ic -> innerInner ic == classType) ics

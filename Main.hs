@@ -13,15 +13,16 @@ import Data.Maybe (mapMaybe)
 test = 
   do   
     streams <- mapM BL.readFile files
-    
-    let decls = map (runGet (getClass $ Just decls)) streams
-    return decls
+    return $ parseClasses streams
   where
-    files = ["test/Foo.class", "test/Foo$Bar.class"]
+    files = ["test/Foo.class", 
+             "test/Foo$Bar.class",
+             "test/Foo$Bar$Quux.class",
+             "test/Foo$IBaz.class",
+             "test/Foo$IBaz$Blargh.class",
+             "test/Foo$1.class"
+             ]
     
 main = 
   do decls <- test     
-     let decls' = mapMaybe (filterTopLevel . snd) decls
-     mapM_ print $ map pretty decls'
-  where filterTopLevel (ImportedTopLevel decl) = Just decl
-        filterTopLevel _ = Nothing
+     mapM_ print $ map (pretty . snd) decls
