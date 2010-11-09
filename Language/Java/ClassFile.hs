@@ -6,7 +6,7 @@ module Language.Java.ClassFile (
   getClass,
   parseClasses,
   -- * Magic identifiers
-  nameConstructor
+  nameConstructor, nameClassConstructor
   ) where
 
 import Language.Java.Syntax
@@ -105,24 +105,27 @@ getMany f =
   do count <- lift getWord16be
      forM [1..count] $ const f
 
-getConstant :: ConstTable -> Get Constant
+getConstant :: ConstTable -> Get (Word16, Constant)
 getConstant constTable = 
   do tag <- getWord8
+     -- trace (show tag) $ return ()
      case tag of
-       1 -> ConstantString <$> getString
-       3 -> ConstantValue <$> ValueInteger <$> getWord32be
-       4 -> ConstantValue <$> ValueFloat <$> getFloat32be
-       5 -> ConstantValue <$> ValueLong <$> getWord64be
-       6 -> ConstantValue <$> ValueDouble <$> getFloat64be
-       7 -> ConstantClass <$> readClassType <$> getStringRef
-       8 -> ConstantValue <$> ValueString <$> getStringRef
-       9 -> ConstantFieldRef <$> getType  <*> getConstIdx
-       10 -> ConstantMethodRef <$> getType <*> getConstIdx
-       11 -> ConstantInterfaceMethodRef <$> getType <*> getConstIdx
-       12 -> ConstantNameAndType <$> getConstIdx <*> getConstIdx
-       tag -> error $ unwords ["Unknown tag type:", show tag] -- return $ Unknown tag
+       1 -> noSkip <$> ConstantString <$> getString
+       3 -> noSkip <$> ConstantValue <$> ValueInteger <$> getWord32be
+       4 -> noSkip <$> ConstantValue <$> ValueFloat <$> getFloat32be
+       5 -> skip <$> ConstantValue <$> ValueLong <$> getWord64be
+       6 -> skip <$> ConstantValue <$> ValueDouble <$> getFloat64be
+       7 -> noSkip <$> ConstantClass <$> readClassType <$> getStringRef
+       8 -> noSkip <$> ConstantValue <$> ValueString <$> getStringRef
+       9 -> noSkip <$> (ConstantFieldRef <$> getType  <*> getConstIdx)
+       10 -> noSkip <$> (ConstantMethodRef <$> getType <*> getConstIdx)
+       11 -> noSkip <$> (ConstantInterfaceMethodRef <$> getType <*> getConstIdx)
+       12 -> noSkip <$> (ConstantNameAndType <$> getConstIdx <*> getConstIdx)
+       tag -> fail $ unwords ["Unknown tag type:", show tag]
   where 
-    getString = toString <$> (getByteString =<< (fromInteger . fromIntegral <$> getWord16be))
+    getString = 
+      do bs <- getByteString =<< (fromInteger . fromIntegral <$> getWord16be)
+         trace (show bs) $ return $ toString bs
     
     lookupString idx = case constTable!idx of
       ConstantString s -> s
@@ -131,14 +134,25 @@ getConstant constTable =
       
     getType = lookupType <$> getConstIdx
     lookupType = constClass . (constTable!)
+    
+    noSkip x = (1, x)
+    skip x = (2, x)
                  
 getConstants :: Get ConstTable
 getConstants = do    
   count <- getWord16be
   rec 
     -- According to the Java .class spec, count is, for some reason, one larger than the actual number of constants
-    consts <- listArray (1, count - 1) <$> (forM [1..count-1] $ const $ getConstant consts)
+    consts <- array (1, count - 1) <$> (fromToM 1 (count - 1) $ \i -> 
+      do (step, const) <- getConstant consts
+         return (step, (i, const)))
+    -- consts <- undefined
   return consts
+  
+fromToM from to f | from > to = return []
+                  | otherwise = 
+  do (step, x) <- f from
+     liftM (x:) $ fromToM (from + step) to f
   
 classObject :: ClassType
 classObject = ClassType [(Ident "java", []), (Ident "lang", []), (Ident "Object", [])]
@@ -146,6 +160,9 @@ classObject = ClassType [(Ident "java", []), (Ident "lang", []), (Ident "Object"
 -- |Constructors are encoded in .class files as member functions of the name \"@\<init>@\".
 nameConstructor :: String
 nameConstructor = "<init>"
+
+nameClassConstructor :: String
+nameClassConstructor = "<clinit>"
 
 getClassType :: ClassImporter ClassType
 getClassType = constClass <$> getConstantRef
@@ -255,7 +272,7 @@ getMethod :: Ident -> ClassImporter (Maybe MemberDecl)
 getMethod cls =
   do modifiers <- getModifiers
      name <- getStringRef
-     let isConstructor = name == nameConstructor
+     let isConstructor = name `elem` [nameConstructor, nameClassConstructor]
      (ret, args) <- readMethodType <$> getStringRef
      let formals = zipWith (\i ty -> FormalParam [] ty False (VarId $ Ident $ 'p':show i)) [(1::Integer)..] args
      attributes <- getAttributes
