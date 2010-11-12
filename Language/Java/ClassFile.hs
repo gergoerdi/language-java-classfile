@@ -1,10 +1,10 @@
 {-# LANGUAGE DoRec #-}
 module Language.Java.ClassFile (
-  ImportedDecl(..),
+  ImportedType(..),
   -- * Classfile parsing
-  getSingleClass, 
   getClass,
   parseClasses,
+  parseJar,
   -- * Magic identifiers
   nameConstructor, nameClassConstructor
   ) where
@@ -23,8 +23,8 @@ import Data.Flags
 import Control.Monad.Reader
 import Text.ParserCombinators.Parsec
 import Data.List
+import Codec.Archive.LibZip
 
-import Debug.Trace
 
 parseFull :: Parser a -> Parser a
 -- language-java depends on Parsec 2, which is not Applicative...
@@ -108,7 +108,6 @@ getMany f =
 getConstant :: ConstTable -> Get (Word16, Constant)
 getConstant constTable = 
   do tag <- getWord8
-     -- trace (show tag) $ return ()
      case tag of
        1 -> noSkip <$> ConstantString <$> getString
        3 -> noSkip <$> ConstantValue <$> ValueInteger <$> getWord32be
@@ -123,9 +122,7 @@ getConstant constTable =
        12 -> noSkip <$> (ConstantNameAndType <$> getConstIdx <*> getConstIdx)
        tag -> fail $ unwords ["Unknown tag type:", show tag]
   where 
-    getString = 
-      do bs <- getByteString =<< (fromInteger . fromIntegral <$> getWord16be)
-         trace (show bs) $ return $ toString bs
+    getString = toString <$> (getByteString =<< (fromInteger . fromIntegral <$> getWord16be))
     
     lookupString idx = case constTable!idx of
       ConstantString s -> s
@@ -146,7 +143,6 @@ getConstants = do
     consts <- array (1, count - 1) <$> (fromToM 1 (count - 1) $ \i -> 
       do (step, const) <- getConstant consts
          return (step, (i, const)))
-    -- consts <- undefined
   return consts
   
 fromToM from to f | from > to = return []
@@ -161,14 +157,12 @@ classObject = ClassType [(Ident "java", []), (Ident "lang", []), (Ident "Object"
 nameConstructor :: String
 nameConstructor = "<init>"
 
+-- |Class constructors are encoded in .class files as static member functions of the name \"@\<clinit>@\".
 nameClassConstructor :: String
 nameClassConstructor = "<clinit>"
 
 getClassType :: ClassImporter ClassType
 getClassType = constClass <$> getConstantRef
-
--- getClassTypeMaybe :: ClassImporter (Maybe ClassType)
--- getClassTypeMaybe = constClassMaybe <$> 
 
 getHeader = 
   do signature <- replicateM 4 getWord8
@@ -313,25 +307,13 @@ getToplevel =
          modifiers = parseModifiers flags
      return (iface, modifiers)
 
-data ImportedDecl = ImportedTopLevel TypeDecl
-                  | ImportedInner ClassType TypeDecl
+data ImportedType = Toplevel TypeDecl
+                  | Inner ClassType TypeDecl
 
-type DeclMap = [(ClassType, ImportedDecl)]
+type DeclMap = [(ClassType, ImportedType)]
 
-getSingleClass :: Get ImportedDecl
-getSingleClass = snd <$> getClass Nothing
-
-parseClasses :: [ByteString] -> [(ClassType, TypeDecl)]
-parseClasses streams = 
-  let declMap = map (runGet (getClass $ Just declMap)) streams 
-  in mapMaybe toDecl declMap
-  where toDecl (classType, (ImportedTopLevel decl)) = Just (classType, decl)
-        toDecl _ = Nothing
-
-
--- |Parse a binary .class file into a 'TypeDecl'
-getClass :: Maybe DeclMap -> Get (ClassType, ImportedDecl)
-getClass declMap = 
+getClass_ :: Maybe DeclMap -> Get (ClassType, ImportedType)
+getClass_ declMap = 
   do (_major, _minor) <- getHeader
      constTable <- getConstants
      flip runReaderT constTable $
@@ -360,13 +342,13 @@ getClass declMap =
                        else ClassTypeDecl $ ClassDecl modifiers this [] super ifaces (ClassBody $ map MemberDecl members)
      
           return (classType, case outer of
-                     Nothing -> ImportedTopLevel decl
-                     Just outer -> ImportedInner outer decl)
+                     Nothing -> Toplevel decl
+                     Just outer -> Inner outer decl)
           
   where toInnerDecl classType ic = 
           do outer <- innerOuter ic             
              guard $ outer == classType
-             ImportedInner _ inner <- lookup (innerInner ic) =<< declMap
+             Inner _ inner <- lookup (innerInner ic) =<< declMap
              let modifiers = parseModifiers $ innerFlags ic
              return $ case inner of
                ClassTypeDecl classDecl -> MemberClassDecl $ classDecl `withClassModifiers` modifiers
@@ -376,3 +358,25 @@ getClass declMap =
         (InterfaceDecl _ id tys ifaces body) `withInterfaceModifiers` ms = InterfaceDecl ms id tys ifaces body
 
         getOuter classType ics = innerInner <$> find (\ ic -> innerInner ic == classType) ics
+
+-- | Parse a bunch of binary .class files
+--
+-- Because inner class declarations are actually described in separate .class files, 
+-- this function needs all relevant .class files. Inner classes in the result are 
+-- represented as proper 'MemberDecl's.
+parseClasses :: [ByteString] -> [(ClassType, TypeDecl)]
+parseClasses streams = mapMaybe toTypeDecl declMap
+  where declMap = map run streams
+        run stream = runGet (getClass_ $ Just declMap) stream
+
+toTypeDecl :: (ClassType, ImportedType) -> Maybe (ClassType, TypeDecl)
+toTypeDecl (classType, (Toplevel decl)) = Just (classType, decl)
+toTypeDecl _ = Nothing
+
+-- | Parse a binary .class file into a 'TypeDecl'.
+getClass :: Get (ClassType, ImportedType)
+getClass = getClass_ Nothing
+
+-- | Parse all classes in a .jar file, and return a list of 'CompilationUnit's corresponding to non-inner classes.
+parseJar :: FilePath -> IO [CompilationUnit]
+parseJar jarPath = undefined
