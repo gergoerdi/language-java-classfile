@@ -1,10 +1,11 @@
 {-# LANGUAGE DoRec #-}
 module Language.Java.ClassFile (
-  ImportedType(..),
   -- * Classfile parsing
+  ImportedType(..),
+  InnerType(..),
   getClass,
-  parseClasses,
-  parseJar,
+  -- parseClasses,
+  -- parseJar,
   -- * Magic identifiers
   nameConstructor, nameClassConstructor
   ) where
@@ -14,17 +15,16 @@ import Data.Binary.Get
 import Data.Binary.IEEE754
 import Data.ByteString.UTF8 (toString)
 import Data.Maybe
-import Data.ByteString.Lazy (ByteString)
 import Control.Monad
 import Data.Word
-import Control.Applicative ((<$>), (<$), (<*>)) -- (<*) (see parseFull)
-import Data.Array
+import Control.Applicative ((<$>), (<$))
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
 import Data.Flags
 import Control.Monad.Reader
 import Text.ParserCombinators.Parsec
 import Data.List
-import Codec.Archive.LibZip
-
+import Control.DeepSeq
 
 parseFull :: Parser a -> Parser a
 -- language-java depends on Parsec 2, which is not Applicative...
@@ -45,41 +45,48 @@ parseType =
   (PrimType ShortT <$ char 'S') <|>
   (PrimType BooleanT <$ char 'Z') <|>
   (RefType <$> ArrayType <$> (char '[' >> parseType)) <|>
-  (RefType <$> ClassRefType <$> (char 'L' >> parseClassType'))
-
-  where parseClassType' = 
-          do x <- parseClassType
-             _ <- char ';'
-             return x
+  (RefType <$> ClassRefType <$> (char 'L' >> parseClassTypeEnd))
 
 readType :: String -> Type
 readType s = case parse (parseFull parseType) "" s of
   Right x -> x
   Left e -> error $ show e
 
+parseRefType :: Parser RefType
+parseRefType =
+  ArrayType <$> (char '[' >> parseType) <|>
+  ClassRefType <$> parseClassType    
+
+readRefType :: String -> RefType             
+readRefType s = 
+  case parse (parseFull parseRefType) "" s of
+    Right x -> x
+    Left e -> error $ unwords [show s, show e]
+
 parseClassType :: Parser ClassType
 parseClassType = 
-  do parts <- (many1 alphaNum) `sepBy` (char '/' <|> char '$')
+  do parts <- (many1 $ alphaNum <|> oneOf "-_") `sepBy` (char '/' <|> char '$')
      let ids = map (\ part -> (Ident part, [])) parts
      return $ ClassType ids
 
-readClassType :: String -> ClassType
-readClassType s = case parse (parseFull parseClassType) "" s of
-  Right x -> x
-  Left e -> error $ show e
+parseClassTypeEnd =
+  do x <- parseClassType
+     _ <- char ';'
+     return x
+
   
 parseMethodType :: Parser (Maybe Type, [Type])
-parseMethodType = do
-  args <- between (char '(') (char ')') (many parseType)
-  ret <- (Nothing <$ char 'V') <|> (Just <$> parseType) 
-  return (ret, args)
+parseMethodType = 
+  do args <- between (char '(') (char ')') (many parseType)
+     ret <- (Nothing <$ char 'V') <|> (Just <$> parseType) 
+     return (ret, args)
   
 readMethodType s = case parse (parseFull parseMethodType) "" s of
   Right x -> x
   Left e -> error $ show e
 
-type ConstIdx = Word16    
-getConstIdx = getWord16be
+type ConstIdx = IntMap.Key
+getConstIdx = fromIntegral <$> getWord16be
 
 data ConstantValue = ValueInteger Word32
                    | ValueFloat Float
@@ -88,62 +95,63 @@ data ConstantValue = ValueInteger Word32
                    | ValueString String
                    deriving Show
 
-data Constant = ConstantClass { constClass :: ClassType }
-              | ConstantFieldRef { constClass :: ClassType, nameAndTypeIdx :: ConstIdx }
-              | ConstantMethodRef { constClass :: ClassType, nameAndTypeIdx :: ConstIdx }
-              | ConstantInterfaceMethodRef { constClass :: ClassType, nameAndTypeIdx :: ConstIdx }
+data Constant = ConstantClass { constRefType :: RefType }
               | ConstantValue ConstantValue
               | ConstantString String
-              | ConstantNameAndType { nameIdx :: ConstIdx, descIdx :: ConstIdx }
-              | Unknown Word8
               deriving Show
   
-type ConstTable = Array Word16 Constant
+type ConstTable = IntMap Constant
 type ClassImporter a = ReaderT ConstTable Get a
 
 getMany f = 
   do count <- lift getWord16be
      forM [1..count] $ const f
 
-getConstant :: ConstTable -> Get (Word16, Constant)
+getConstant :: ConstTable -> Get (ConstIdx, Maybe Constant)
 getConstant constTable = 
   do tag <- getWord8
      case tag of
-       1 -> noSkip <$> ConstantString <$> getString
-       3 -> noSkip <$> ConstantValue <$> ValueInteger <$> getWord32be
-       4 -> noSkip <$> ConstantValue <$> ValueFloat <$> getFloat32be
-       5 -> skip <$> ConstantValue <$> ValueLong <$> getWord64be
-       6 -> skip <$> ConstantValue <$> ValueDouble <$> getFloat64be
-       7 -> noSkip <$> ConstantClass <$> readClassType <$> getStringRef
-       8 -> noSkip <$> ConstantValue <$> ValueString <$> getStringRef
-       9 -> noSkip <$> (ConstantFieldRef <$> getType  <*> getConstIdx)
-       10 -> noSkip <$> (ConstantMethodRef <$> getType <*> getConstIdx)
-       11 -> noSkip <$> (ConstantInterfaceMethodRef <$> getType <*> getConstIdx)
-       12 -> noSkip <$> (ConstantNameAndType <$> getConstIdx <*> getConstIdx)
+       1 -> noSkip <$> Just <$> ConstantString <$> getString
+       3 -> noSkip <$> Just <$> ConstantValue <$> ValueInteger <$> getWord32be
+       4 -> noSkip <$> Just <$> ConstantValue <$> ValueFloat <$> getFloat32be
+       5 -> skip <$> Just <$> ConstantValue <$> ValueLong <$> getWord64be
+       6 -> skip <$> Just <$> ConstantValue <$> ValueDouble <$> getFloat64be
+       7 -> noSkip <$> Just <$> ConstantClass <$> readRefType <$> getStringRef
+       8 -> noSkip <$> Just <$> ConstantValue <$> ValueString <$> getStringRef
+       
+       9 -> noSkip <$> (getConstIdx >> getConstIdx >> return Nothing)
+       10 -> noSkip <$> (getConstIdx >> getConstIdx >> return Nothing)
+       11 -> noSkip <$> (getConstIdx >> getConstIdx >> return Nothing)
+       12 -> noSkip <$> (getConstIdx >> getConstIdx >> return Nothing)
+       
        tag -> fail $ unwords ["Unknown tag type:", show tag]
   where 
     getString = toString <$> (getByteString =<< (fromInteger . fromIntegral <$> getWord16be))
     
-    lookupString idx = case constTable!idx of
-      ConstantString s -> s
+    -- lookupString idx = case IntMap.lookup idx constTable of
+    --   Just (ConstantString s) -> s
       
-    getStringRef = lookupString <$> getConstIdx
+    -- getStringRef = lookupString <$> getConstIdx
+
+    getStringRef = do idx <- getConstIdx
+                      let Just (ConstantString s) = IntMap.lookup idx constTable
+                      return s
       
-    getType = lookupType <$> getConstIdx
-    lookupType = constClass . (constTable!)
-    
     noSkip x = (1, x)
     skip x = (2, x)
                  
 getConstants :: Get ConstTable
-getConstants = do    
-  count <- getWord16be
-  rec 
-    -- According to the Java .class spec, count is, for some reason, one larger than the actual number of constants
-    consts <- array (1, count - 1) <$> (fromToM 1 (count - 1) $ \i -> 
-      do (step, const) <- getConstant consts
-         return (step, (i, const)))
-  return consts
+getConstants = 
+  do count <- fromIntegral <$> getWord16be
+     rec 
+       -- According to the Java .class spec, count is, for some reason, one larger than the actual number of constants
+       consts <- IntMap.fromAscList <$> mapMaybe filter <$> (fromToM 1 (count - 1) $ \i -> 
+         do (step, const) <- getConstant consts
+            return (step, (i, const)))
+     return consts
+     
+  where filter (_, Nothing) = Nothing
+        filter (i, Just c) = Just (i, c)
   
 fromToM from to f | from > to = return []
                   | otherwise = 
@@ -161,8 +169,13 @@ nameConstructor = "<init>"
 nameClassConstructor :: String
 nameClassConstructor = "<clinit>"
 
+constClassType con = let ClassRefType cls = constRefType con in cls
+
+getClassTypeMaybe :: ClassImporter (Maybe ClassType)
+getClassTypeMaybe = fmap constClassType <$> getConstantRefMaybe
+
 getClassType :: ClassImporter ClassType
-getClassType = constClass <$> getConstantRef
+getClassType = constClassType <$> fromMaybe (error "getClassType") <$> getConstantRefMaybe
 
 getHeader = 
   do signature <- replicateM 4 getWord8
@@ -175,10 +188,10 @@ getHeader =
 getConstantRefMaybe :: ClassImporter (Maybe Constant)
 getConstantRefMaybe =
   do idx <- lift getConstIdx
-     if idx == 0 then return Nothing else Just <$> asks (!idx)
+     if idx == 0 then return Nothing else asks (IntMap.lookup idx)
 
 getConstantRef :: ClassImporter Constant
-getConstantRef = fromJust <$> getConstantRefMaybe
+getConstantRef = fromMaybe (error "getConstantRef") <$> getConstantRefMaybe
                        
 getStringRefMaybe ::ClassImporter (Maybe String)                 
 getStringRefMaybe = 
@@ -188,7 +201,7 @@ getStringRefMaybe =
        _ -> Nothing
                  
 getStringRef :: ClassImporter String
-getStringRef = fromJust <$> getStringRefMaybe
+getStringRef = fromMaybe (fail "getStringRef") <$> getStringRefMaybe
      
 data InnerClass = InnerClass { innerInner :: ClassType, 
                                innerOuter :: Maybe ClassType,
@@ -217,7 +230,7 @@ isAttrInnerClasses _ = False
 getInnerClass :: ClassImporter InnerClass
 getInnerClass =
   do inner <- getClassType
-     outer <- fmap constClass <$> getConstantRefMaybe
+     outer <- fmap constClassType <$> getConstantRefMaybe
      name <- getStringRefMaybe
      flags <- lift getWord16be
      return $ InnerClass inner outer name flags
@@ -307,22 +320,48 @@ getToplevel =
          modifiers = parseModifiers flags
      return (iface, modifiers)
 
-data ImportedType = Toplevel TypeDecl
-                  | Inner ClassType TypeDecl
+-- | Descriptor of an inner (nested) type. 
+-- 
+-- The actual definition of inner types are not in the .class file, but
+-- in separate ones for each type. E.g. if class @Foo@ is defined
+-- inside class @Bar@, then the file @Bar.class@ will contain an
+-- 'InnerType' for Foo, and the actual definition is in
+-- @Bar$Foo.class@.
+data InnerType = InnerType [Modifier] ClassType
+               deriving Show
+                        
+data ImportedType = Toplevel { importedDecl :: TypeDecl, importedInnerTypes ::  [InnerType]}
+                  | Inner { importedOuterType :: ClassType, importedDecl :: TypeDecl, importedInnerTypes ::  [InnerType] }
+                  deriving Show
 
+instance NFData Constant where
+  rnf (ConstantClass ty) = ty `seq` ()
+  rnf (ConstantValue value) = value `deepseq` ()
+  rnf (ConstantString s) = s `deepseq` ()    
+
+instance NFData ConstantValue where
+  rnf (ValueString s) = s `deepseq` ()
+  rnf (ValueInteger n) = n `seq` ()
+  rnf (ValueLong n) = n `seq` ()
+  rnf (ValueFloat f) = f `seq` ()
+  rnf (ValueDouble f) = f `seq` ()
+  
 type DeclMap = [(ClassType, ImportedType)]
 
-getClass_ :: Maybe DeclMap -> Get (ClassType, ImportedType)
-getClass_ declMap = 
+-- | Parse a binary .class file into an 'ImportedType'.
+getClass :: Get (ClassType, ImportedType)
+getClass = 
   do (_major, _minor) <- getHeader
      constTable <- getConstants
-     flip runReaderT constTable $
+     constTable `deepseq` flip runReaderT constTable $
        do (isInterface, modifiers) <- getToplevel
      
           classType@(ClassType parts) <- getClassType
           let (this, _) = last parts
-          superClass <- getClassType
-          let super = if superClass == classObject then Nothing else Just (ClassRefType superClass)
+          superClass <- getClassTypeMaybe
+          let super = case superClass of
+                Nothing -> Nothing
+                Just superClass -> if superClass /= classObject then Just $ ClassRefType superClass else Nothing
      
           ifaces <- getMany (ClassRefType <$> getClassType)
           fields <- catMaybes <$> getMany getField
@@ -333,50 +372,46 @@ getClass_ declMap =
                 case find isAttrInnerClasses attributes of
                   Nothing -> []
                   Just (AttrInnerClasses ics) -> ics                  
-              innerDecls = mapMaybe (toInnerDecl classType) innerClasses
+              innerDecls = mapMaybe (toInnerType classType) innerClasses
               outer = getOuter classType innerClasses
               
-          let members = fields ++ methods ++ innerDecls
+          let members = fields ++ methods
               decl = if isInterface
                        then InterfaceTypeDecl $ InterfaceDecl modifiers this [] ifaces (InterfaceBody members)
                        else ClassTypeDecl $ ClassDecl modifiers this [] super ifaces (ClassBody $ map MemberDecl members)
      
           return (classType, case outer of
-                     Nothing -> Toplevel decl
-                     Just outer -> Inner outer decl)
+                     Nothing -> Toplevel decl innerDecls
+                     Just outer -> Inner outer decl innerDecls)
           
-  where toInnerDecl classType ic = 
+  where toInnerType classType ic = 
           do outer <- innerOuter ic             
              guard $ outer == classType
-             Inner _ inner <- lookup (innerInner ic) =<< declMap
-             let modifiers = parseModifiers $ innerFlags ic
-             return $ case inner of
-               ClassTypeDecl classDecl -> MemberClassDecl $ classDecl `withClassModifiers` modifiers
-               InterfaceTypeDecl ifaceDecl -> MemberInterfaceDecl $ ifaceDecl `withInterfaceModifiers` modifiers
+             let inner = innerInner ic
+                 modifiers = parseModifiers $ innerFlags ic
+             return $ InnerType modifiers inner
         
-        (ClassDecl _ id tys super ifaces body) `withClassModifiers` ms = ClassDecl ms id tys super ifaces body
-        (InterfaceDecl _ id tys ifaces body) `withInterfaceModifiers` ms = InterfaceDecl ms id tys ifaces body
+        -- (ClassDecl _ id tys super ifaces body) `withClassModifiers` ms = ClassDecl ms id tys super ifaces body
+        -- (InterfaceDecl _ id tys ifaces body) `withInterfaceModifiers` ms = InterfaceDecl ms id tys ifaces body
 
-        getOuter classType ics = innerInner <$> find (\ ic -> innerInner ic == classType) ics
+        getOuter classType ics = innerOuter =<< find (\ ic -> innerInner ic == classType) ics
 
--- | Parse a bunch of binary .class files
---
--- Because inner class declarations are actually described in separate .class files, 
--- this function needs all relevant .class files. Inner classes in the result are 
--- represented as proper 'MemberDecl's.
-parseClasses :: [ByteString] -> [(ClassType, TypeDecl)]
-parseClasses streams = mapMaybe toTypeDecl declMap
-  where declMap = map run streams
-        run stream = runGet (getClass_ $ Just declMap) stream
+-- WIP:
+--        
+-- -- | Parse a bunch of binary .class files
+-- --
+-- -- Because inner class declarations are actually described in separate .class files, 
+-- -- this function needs all relevant .class files. Inner classes in the result are 
+-- -- represented as proper 'MemberDecl's.
+-- parseClasses :: [ByteString] -> [(ClassType, TypeDecl)]
+-- parseClasses streams = mapMaybe toTypeDecl declMap
+--   where declMap = map run streams
+--         run stream = runGet (getClass_ $ Just declMap) stream
 
-toTypeDecl :: (ClassType, ImportedType) -> Maybe (ClassType, TypeDecl)
-toTypeDecl (classType, (Toplevel decl)) = Just (classType, decl)
-toTypeDecl _ = Nothing
+-- toTypeDecl :: (ClassType, ImportedType) -> Maybe (ClassType, TypeDecl)
+-- toTypeDecl (classType, (Toplevel decl)) = Just (classType, decl)
+-- toTypeDecl _ = Nothing
 
--- | Parse a binary .class file into a 'TypeDecl'.
-getClass :: Get (ClassType, ImportedType)
-getClass = getClass_ Nothing
-
--- | Parse all classes in a .jar file, and return a list of 'CompilationUnit's corresponding to non-inner classes.
-parseJar :: FilePath -> IO [CompilationUnit]
-parseJar jarPath = undefined
+-- -- | Parse all classes in a .jar file, and return a list of 'CompilationUnit's corresponding to non-inner classes.
+-- parseJar :: FilePath -> IO [CompilationUnit]
+-- parseJar jarPath = undefined

@@ -7,44 +7,43 @@ import Language.Java.ClassFile
 import Data.Binary.Get  
 import qualified Data.ByteString.Lazy as BL
 import Control.Applicative
-import Control.Monad (replicateM, forM_)
+import Control.Monad (replicateM, forM, forM_, mapM, mapM_)
 import Data.Maybe (mapMaybe)
 import System.Path
 import Codec.Archive.LibZip
+import System.IO.HVFS
 
-test = 
-  do streams <- mapM BL.readFile files
-     return $ parseClasses streams
+import Control.DeepSeq
+import Debug.Trace
+
+main = do 
+  decls <- testJar
+  mapM_ print decls
+  -- forM_ decls $ \(ClassType parts, decl) ->
+  --   do print $ pretty $ CompilationUnit (Just $ PackageDecl $ Name $ map fst $ init parts) [] [decl]
+
+isClassfile path = snd (splitExt path) == ".class"
+
+testFiles = do 
+  files <- filter isClassfile <$> recurseDir SystemFS classRoot
+  forM files $ \file -> do    
+    stream <- BL.readFile file
+    let result = runGet getClass stream
+    show result `deepseq` return result        
   where
-    -- files = ["test/Foo.class", 
-    --          "test/Foo$Bar.class",
-    --          "test/Foo$Bar$Quux.class",
-    --          "test/Foo$IBaz.class",
-    --          "test/Foo$IBaz$Blargh.class",
-    --          "test/Foo$1.class"
-    --          ]
-    files = ["/tmp/jar/java/lang/Short.class",
-             "/tmp/jar/java/lang/Short$ShortCache.class"]
+    classRoot = "/tmp/jar"
     
-main = 
-  do decls <- testJar
-     forM_ decls $ \(ClassType parts, decl) ->
-       do print $ pretty $ CompilationUnit (Just $ PackageDecl $ Name $ map fst $ init parts) [] [decl]
-
-testZipList = 
-  do withArchive [CheckConsFlag] jarPath $ do
-       files <- filter isClassfile <$> fileNames []
-       return files
-  where
-    jarPath = "/usr/lib/jvm/java-6-sun-1.6.0.22/jre/lib/rt.jar"
-    isClassfile path = snd (splitExt path) == ".class"
-
-testJar =
-  do withArchive [CheckConsFlag] jarPath $ do
-       classfiles <- filter isClassfile <$> fileNames []
-       streams <- mapM (fileContents []) classfiles
-       return $ parseClasses (map BL.pack streams)
+testJar = do 
+  withArchive [CheckConsFlag] jarPath $ do
+    classfiles <- filter isClassfile <$> fileNames []
+    forM classfiles $ \classfile -> do
+      stream <- BL.pack <$> fileContents [] classfile
+      let result = runGet getClass stream
+      return result
+      -- show result `deepseq` return result
+         -- lift $ print result
+         -- result `deepseq` return result
   where 
-    files = ["java/lang/Class.class"]
-    jarPath = "/usr/lib/jvm/java-6-sun-1.6.0.22/jre/lib/rt.jar"                      
-    isClassfile path = snd (splitExt path) == ".class"
+    -- jarPath = "/usr/lib/jvm/java-6-sun-1.6.0.22/jre/lib/rt.jar"                      
+    jarPath = "/home/cactus/pkg/logisim-generic-2.5.1.jar"
+    -- jarPath = "/tmp/foo.jar"

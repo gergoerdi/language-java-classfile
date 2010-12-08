@@ -7,7 +7,7 @@ Name:                language-java-classfile
 -- The package version. See the Haskell package versioning policy
 -- (http://www.haskell.org/haskellwiki/Package_versioning_policy) for
 -- standards guiding when and how versions should be incremented.
-Version:             0.1
+Version:             0.2.0
 
 Synopsis:            Parser for Java .class files
 Description:         Parses compiled Java .class files into the syntax tree
@@ -18,8 +18,8 @@ License:             BSD3
 -- The file containing the license text.
 License-file:        LICENSE
 
-Author:              Dr. ERDI Gergo <http://gergo.erdi.hu/>
-Maintainer:          Dr. ERDI Gergo <gergo@erdi.hu>
+Author:              Gergő Érdi <http://gergo.erdi.hu/>
+Maintainer:          Gergő Érdi <gergo@erdi.hu>
 
 -- A copyright notice.
 -- Copyright:           
@@ -41,11 +41,14 @@ Library
   Build-depends:       base >= 2 && < 5,
                        parsec >= 2 && < 4,
                        language-java,
+                       deepseq,
+                       containers,
                        mtl,
                        data-flags,
                        array,
                        utf8-string, bytestring,
-                       data-binary-ieee754, binary
+                       data-binary-ieee754, binary,
+                       LibZip
   
   -- Modules not exported by this package.
   -- Other-modules:       
