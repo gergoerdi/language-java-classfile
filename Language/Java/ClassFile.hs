@@ -1,7 +1,7 @@
 {-# LANGUAGE DoRec #-}
 module Language.Java.ClassFile (
   -- * Classfile parsing
-  ImportedType(..),
+  ClassImportResult(..),
   InnerType(..),
   getClass,
   -- parseClasses,
@@ -25,6 +25,7 @@ import Control.Monad.Reader
 import Text.ParserCombinators.Parsec
 import Data.List
 import Control.DeepSeq
+import Data.Monoid
 
 parseFull :: Parser a -> Parser a
 -- language-java depends on Parsec 2, which is not Applicative...
@@ -213,20 +214,9 @@ data Attribute = AttrConstantValue ConstantValue
                | AttrExceptions [ClassType]
                | AttrSynthetic
                | AttrInnerClasses [InnerClass]
+               | AttrSourceFile String
                deriving Show
                         
-isAttrSynthetic AttrSynthetic = True
-isAttrSynthetic _ = False
-     
-isAttrConstantValue (AttrConstantValue _) = True
-isAttrConstantValue _ = False
-                    
-isAttrExceptions (AttrExceptions _) = True
-isAttrExceptions _ = False                     
-                     
-isAttrInnerClasses (AttrInnerClasses _) = True
-isAttrInnerClasses _ = False
-
 getInnerClass :: ClassImporter InnerClass
 getInnerClass =
   do inner <- getClassType
@@ -250,7 +240,9 @@ getAttribute =
        "Exceptions" ->
          Just <$> AttrExceptions <$> getMany getClassType
        "InnerClasses" ->
-         do Just <$> AttrInnerClasses <$> getMany getInnerClass            
+         Just <$> AttrInnerClasses <$> getMany getInnerClass            
+       "SourceFile" ->
+         Just <$> AttrSourceFile <$> getStringRef
        _ -> 
          do lift $ skip (fromIntegral len)
             return Nothing
@@ -273,7 +265,9 @@ getField =
                ValueFloat x -> Float $ realToFrac x
                ValueDouble x -> Double x
      return $ unlessSynthetic attributes $ 
-       FieldDecl modifiers ty [VarDecl (VarId $ Ident name) init]   
+       FieldDecl modifiers ty [VarDecl (VarId $ Ident name) init]          
+  where isAttrConstantValue (AttrConstantValue _) = True
+        isAttrConstantValue _ = False                     
 
 getMethod :: Ident -> ClassImporter (Maybe MemberDecl)
 getMethod cls =
@@ -283,9 +277,13 @@ getMethod cls =
      (ret, args) <- readMethodType <$> getStringRef
      let formals = zipWith (\i ty -> FormalParam [] ty False (VarId $ Ident $ 'p':show i)) [(1::Integer)..] args
      attributes <- getAttributes
-     let exceptions = case find (isAttrExceptions) attributes of
+     
+     let getAttrExceptions (AttrExceptions tys) = Just tys
+         getAttrExceptions _ = Nothing
+         exceptions = case mapFirst getAttrExceptions attributes of
            Nothing -> []
-           Just (AttrExceptions tys) -> map ClassRefType tys
+           Just tys -> map ClassRefType tys
+             
      return $ unlessSynthetic attributes $
        if isConstructor 
          then ConstructorDecl modifiers [] cls formals exceptions (ConstructorBody Nothing [])
@@ -293,6 +291,8 @@ getMethod cls =
 
 unlessSynthetic :: [Attribute] -> a -> Maybe a
 unlessSynthetic attributes x = if any isAttrSynthetic attributes then Nothing else Just x
+  where isAttrSynthetic AttrSynthetic = True
+        isAttrSynthetic _ = False
 
 parseModifiers :: Word16 -> [Modifier]
 parseModifiers flags =
@@ -330,10 +330,13 @@ getToplevel =
 data InnerType = InnerType [Modifier] ClassType
                deriving Show
                         
-data ImportedType = Toplevel { importedDecl :: TypeDecl, importedInnerTypes ::  [InnerType]}
-                  | Inner { importedOuterType :: ClassType, importedDecl :: TypeDecl, importedInnerTypes ::  [InnerType] }
-                  deriving Show
-
+data ClassImportResult = ClassImportResult 
+                         { sourcePath :: Maybe String,
+                           outerType :: Maybe ClassType,
+                           typeDecl :: TypeDecl,
+                           innerTypes :: [InnerType] }
+                       deriving Show
+  
 instance NFData Constant where
   rnf (ConstantClass ty) = ty `seq` ()
   rnf (ConstantValue value) = value `deepseq` ()
@@ -346,10 +349,10 @@ instance NFData ConstantValue where
   rnf (ValueFloat f) = f `seq` ()
   rnf (ValueDouble f) = f `seq` ()
   
-type DeclMap = [(ClassType, ImportedType)]
-
+mapFirst f = getFirst . mconcat . map (First . f)
+  
 -- | Parse a binary .class file into an 'ImportedType'.
-getClass :: Get (ClassType, ImportedType)
+getClass :: Get (ClassType, ClassImportResult)
 getClass = 
   do (_major, _minor) <- getHeader
      constTable <- getConstants
@@ -368,21 +371,22 @@ getClass =
           methods <- catMaybes <$> getMany (getMethod this)
           
           attributes <- getAttributes
-          let innerClasses = 
-                case find isAttrInnerClasses attributes of
-                  Nothing -> []
-                  Just (AttrInnerClasses ics) -> ics                  
+          let sourcePath = mapFirst getSourceFile attributes
+                where getSourceFile (AttrSourceFile path) = Just path
+                      getSourceFile _ = Nothing
+          
+          let innerClasses = fromMaybe [] $ mapFirst getInnerClasses attributes
+                where getInnerClasses (AttrInnerClasses ics) = Just ics
+                      getInnerClasses _ = Nothing
               innerDecls = mapMaybe (toInnerType classType) innerClasses
-              outer = getOuter classType innerClasses
+              outer = getOuter classType innerClasses                      
               
           let members = fields ++ methods
               decl = if isInterface
                        then InterfaceTypeDecl $ InterfaceDecl modifiers this [] ifaces (InterfaceBody members)
                        else ClassTypeDecl $ ClassDecl modifiers this [] super ifaces (ClassBody $ map MemberDecl members)
      
-          return (classType, case outer of
-                     Nothing -> Toplevel decl innerDecls
-                     Just outer -> Inner outer decl innerDecls)
+          return (classType, ClassImportResult sourcePath outer decl innerDecls)
           
   where toInnerType classType ic = 
           do outer <- innerOuter ic             
@@ -398,6 +402,7 @@ getClass =
 
 -- WIP:
 --        
+-- type DeclMap = [(ClassType, ImportedType)]
 -- -- | Parse a bunch of binary .class files
 -- --
 -- -- Because inner class declarations are actually described in separate .class files, 
